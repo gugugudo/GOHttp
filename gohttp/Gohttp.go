@@ -1,7 +1,7 @@
 // 包声明：标准main包，可编译为可执行程序，可拓展CGO导出为DLL/SO
 package main
 
-// 导入项目依赖标准库与第三方HTTP库
+import "C"
 import (
 	"bytes"      // 字节缓冲区，用于读取、缓存HTTP响应二进制流
 	"crypto/tls" // TLS证书工具，支持客户端双向HTTPS认证
@@ -10,7 +10,6 @@ import (
 	"strings" // 字符串分割、清洗，解析自定义请求头
 	"sync"    // 并发锁，解决多线程竞争、保证线程安全
 	"time"    // 时间类型，用于HTTP超时配置
-
 	// 高性能HTTP第三方库：req/v3
 	// 支持指纹伪装、HTTP1.1/2、代理、证书配置、链式调用，稳定性极强
 	"github.com/imroc/req/v3"
@@ -67,14 +66,14 @@ type HTTPContext struct {
 var HTTPMap = make(map[int]*HTTPContext)
 
 // HTTPMapLock 全局注册表读写锁，保证多协程增删查上下文安全
-var HTTPMapLock sync.RWMutex
+var HTTPMapLock sync.Mutex
 
 // LoadHTTPContext 根据上下文ID加载对应HTTP实例
 // 线程安全：全局加锁读取，避免并发读写map报错
 func LoadHTTPContext(ctxID int) *HTTPContext {
-	HTTPMapLock.RLock()
+	HTTPMapLock.Lock()
 	context := HTTPMap[ctxID]
-	HTTPMapLock.RUnlock()
+	HTTPMapLock.Unlock()
 	return context
 }
 
@@ -479,8 +478,31 @@ func HTTPGetResponseBodyBin(ctxID int) ([]byte, bool) {
 	return hc.BodyBuf, true
 }
 
-// HTTPGetResponseHeaders 获取完整响应头字符串
+// HTTPGetResponseHeaderAll 一次性取出完整头字符串 + Location，只锁一次，无并发竞争
+func HTTPGetResponseHeaderAll(ctxID int) (fullHeader string, location string, ok bool) {
+	defer func() { _ = recover() }()
+	hc := LoadHTTPContext(ctxID)
+	if hc == nil {
+		return "", "", false
+	}
+	hc.Lock.Lock()
+	defer hc.Lock.Unlock()
+
+	if hc.Response == nil || hc.Response.Header == nil {
+		hc.Error = "not Open"
+		return "", "", false
+	}
+	fullHeader = hc.Response.HeaderToString()
+	location = hc.Response.Header.Get("Location")
+	// 切断底层内存引用，杜绝野指针
+	fullHeader = strings.Clone(fullHeader)
+	location = strings.Clone(location)
+	return fullHeader, location, true
+}
+
+// HTTPGetResponseHeaders 获取完整响应头字符串（修复空指针、panic、野指针）
 func HTTPGetResponseHeaders(ctxID int) (string, bool) {
+	defer func() { _ = recover() }()
 	hc := LoadHTTPContext(ctxID)
 	if hc == nil {
 		return "", false
@@ -488,19 +510,45 @@ func HTTPGetResponseHeaders(ctxID int) (string, bool) {
 	hc.Lock.Lock()
 	defer hc.Lock.Unlock()
 
-	if hc.Response == nil {
+	// 和Location接口统一判空逻辑
+	if hc.Response == nil || hc.Response.Header == nil {
 		hc.Error = "not Open"
 		return "", false
 	}
 
-	return hc.Response.HeaderToString(), true
+	s := hc.Response.HeaderToString()
+	// 复制独立内存，防止原Header销毁后野指针
+	return strings.Clone(s), true
 }
 
-// HTTPGetResponseLocation 获取响应Location头，等价易语言网页_协议头_取信息(返回协议头,"Location")
-func HTTPGetResponseLocation(ctxID int) (string, bool) {
+func HTTPGetResponseHeader(ctxID int, key string) (string, bool) {
 	defer func() {
-		recover()
+		_ = recover()
 	}()
+
+	hc := LoadHTTPContext(ctxID)
+	if hc == nil {
+		return "", false
+	}
+
+	hc.Lock.Lock()
+	defer hc.Lock.Unlock()
+
+	if hc.Response == nil || hc.Response.Header == nil {
+		hc.Error = "not Open"
+		return "", false
+	}
+
+	// 读取并克隆，断开原Header底层内存引用，防止野指针
+	val := hc.Response.Header.Get(key)
+	safeVal := strings.Clone(val)
+
+	return safeVal, true
+}
+
+// HTTPGetResponseLocation 获取响应Location头（修复recover失效问题）
+func HTTPGetResponseLocation(ctxID int) (string, bool) {
+	defer func() { _ = recover() }()
 
 	hc := LoadHTTPContext(ctxID)
 	if hc == nil {
@@ -513,7 +561,8 @@ func HTTPGetResponseLocation(ctxID int) (string, bool) {
 		return "", false
 	}
 
-	return hc.Response.Header.Get("Location"), true
+	val := hc.Response.Header.Get("Location")
+	return strings.Clone(val), true
 }
 
 // HTTPGetResponseStatusCode 获取HTTP状态码（200/404/500等数字码）
