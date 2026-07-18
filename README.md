@@ -59,8 +59,6 @@ go mod tidy
 func main() {
 	// 创建HTTP请求上下文（唯一实例ID）
 	ctxID := HTTPCreate()
-	defer HTTPRemove(ctxID) // 自动释放资源
-
 	// 初始化GET请求
 	HTTPOpen(ctxID, "GET", "https://bfweb.hk.beanfun.com/game_zone/")
 
@@ -84,6 +82,8 @@ func main() {
 	println("请求状态：", status)
 	println("跳转地址：", redirectUrl)
 	println("响应内容：", res)
+
+	HTTPRemove(ctxID) // 释放资源
 }
 ```
 
